@@ -1,0 +1,219 @@
+---
+title: "TS II HW III"
+author: "Andrew Lewis"
+date: "2024-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Loading packages
+library(ggplot2)
+library(zoo)
+library(slider)
+library(readr)
+library(fpp3)
+library(forecast)
+library(imputeTS)
+```
+
+```{r}
+# Load the data
+train <- read_csv('hrl_load_metered.csv')
+val1 <- read_csv("hrl_load_metered - test1.csv")
+val2 <- read_csv("hrl_load_metered - test2.csv")
+val3 <- read_csv("hrl_load_metered - test3.csv")
+val4 <- read_csv("hrl_load_metered - test4.csv")
+test <- read_csv("hrl_load_metered - test5.csv")
+
+# Converting the time variable to proper format
+train$datetime_beginning_ept <- as.POSIXct(train$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val1$datetime_beginning_ept <- as.POSIXct(val1$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val2$datetime_beginning_ept <- as.POSIXct(val2$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val3$datetime_beginning_ept <- as.POSIXct(val3$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val4$datetime_beginning_ept <- as.POSIXct(val4$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+test$datetime_beginning_ept <- mdy_hms(test$datetime_beginning_ept, tz = "America/New_York")
+# test$datetime_beginning_ept <- as.POSIXct(test$datetime_beginning_ept, format = "%m/%d/%y %H:%M %p", tz = "America/New_York")
+
+# Adding the first validation set back into the training set
+train <- rbind(train, val1)
+train <- rbind(train, val2)
+train <- rbind(train, val3)
+train <- rbind(train, val4)
+
+train <- train %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+test <- test %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+# Averaging the Fall DST Values
+train <- train %>% group_by(datetime_beginning_ept) %>%
+   summarize(mw_new = mean(mw), na.rm = TRUE, Adjusted = first(Adjusted))
+
+train_ts <- train %>% as_tsibble(index = datetime_beginning_ept)
+test_ts <- test %>% as_tsibble(index = datetime_beginning_ept)
+
+# Impute missing times
+energy_impute <- train_ts %>% fill_gaps() %>%
+  mutate(mw = na_interpolation(mw_new, option = "linear"))
+
+energy_impute <- as_tsibble(energy_impute, index = datetime_beginning_ept)
+
+# Confirming which observations were imputed
+imputed <- anti_join(energy_impute, train_ts, by = "datetime_beginning_ept")
+
+# Add "Adjusted" flag to imputed observations
+train_ts <- energy_impute %>%
+ mutate(Adjusted = if_else(datetime_beginning_ept %in% imputed$datetime_beginning_ept, 1, 0))
+```
+
+```{r}
+library(fable.prophet)
+set.seed(12345)
+train_ts$hurricane <- rep(0, 59399)
+train_ts$hurricane[59040:59088] <- 1
+
+train_ts_trim <- train_ts %>%
+  filter(datetime_beginning_ept >= "2024-09-01 00:00:00")
+
+models <- train_ts_trim %>%
+  model(ESM = ETS(mw ~ error("M") + trend("A") + season("M")),
+        Fourier = ARIMA(mw ~ fourier(K = 3, period = 24) + pdq(1,1,2) + PDQ(1,0,0) + 1),
+        Prophet = prophet(mw ~ hurricane +
+                  growth("linear") + 
+                  season(period = "day", order = 3, type = "multiplicative"))) %>%
+  mutate(Combo = (ESM + Fourier + Prophet) / 3)
+
+nnet_model <- train_ts_trim %>%
+  mutate(diff_mw = difference(mw, 24)) %>%
+  model(NNET = NNETAR(diff_mw ~ hurricane + AR(p = 1, P = 4)))
+```
+
+```{r}
+# Comparing various models based on their performance on the validation set
+test_ts$hurricane <- rep(0, 168)
+energy_fc <- models %>% fabletools::forecast(test_ts)
+fabletools::accuracy(energy_fc, test_ts) %>% arrange(MAPE)
+```
+
+```{r}
+diff_NN_model <- nnet_model %>% select(NNET)
+diff_NN_for <- forecast(diff_NN_model, test_ts)
+
+nnet_for <- rep(NA, 168)
+
+for(i in 1:24){
+  nnet_for[i] <- energy_impute$mw[length(train_ts$mw) - 24 + i] + diff_NN_for$.mean[i]
+}
+
+for(i in 25:168) {
+  # For the next 5 seasons (days) using forecasted values from first season instead of the original data
+  nnet_for[i] <- nnet_for[i - 24] + diff_NN_for$.mean[i]
+}
+
+NN_error <- test_ts$mw - nnet_for
+
+NN_MAE <- mean(abs(NN_error))
+NN_MAPE <- mean(abs(NN_error)/abs(test_ts$mw))*100
+
+NN_MAE
+NN_MAPE
+```
+
+```{r}
+test2 <- read_csv("hrl_load_metered - test6.csv")
+test2$datetime_beginning_ept <- as.POSIXct(test2$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+
+train <- train %>% select(datetime_beginning_ept, mw_new, Adjusted) %>%
+  rename(mw = mw_new)
+test <- test %>% select(datetime_beginning_ept, mw, Adjusted)
+train <- rbind(train, test)
+
+train <- train %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+test <- test2 %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+# Averaging the Fall DST Values
+train <- train %>% group_by(datetime_beginning_ept) %>%
+   summarize(mw_new = mean(mw), na.rm = TRUE, Adjusted = first(Adjusted))
+
+train_ts <- train %>% as_tsibble(index = datetime_beginning_ept)
+test_ts <- test2 %>% as_tsibble(index = datetime_beginning_ept)
+
+# Impute missing times
+energy_impute <- train_ts %>% fill_gaps() %>%
+  mutate(mw = na_interpolation(mw_new, option = "linear"))
+
+energy_impute <- as_tsibble(energy_impute, index = datetime_beginning_ept)
+
+# Confirming which observations were imputed
+imputed <- anti_join(energy_impute, train_ts, by = "datetime_beginning_ept")
+
+# Add "Adjusted" flag to imputed observations
+train_ts <- energy_impute %>%
+ mutate(Adjusted = if_else(datetime_beginning_ept %in% imputed$datetime_beginning_ept, 1, 0))
+```
+
+```{r}
+set.seed(12345)
+train_ts$hurricane <- rep(0, 59567)
+train_ts$hurricane[59040:59088] <- 1
+
+train_ts_trim <- train_ts %>%
+  filter(datetime_beginning_ept >= "2024-09-01 00:00:00")
+
+models <- train_ts_trim %>%
+  mutate(diff_mw = difference(mw, 24)) %>%
+  model(ESM = ETS(mw ~ error("M") + trend("A") + season("M")),
+        Fourier = ARIMA(mw ~ fourier(K = 3, period = 24) + pdq(1,1,2) + PDQ(1,0,0) + 1),
+        Prophet = prophet(mw ~ hurricane +
+                  growth("linear") + 
+                  season(period = "day", order = 3, type = "multiplicative"))) %>%
+  mutate(Combo = (ESM + Fourier + Prophet) / 3)
+
+nnet_model <- train_ts_trim %>%
+  mutate(diff_mw = difference(mw, 24)) %>%
+  model(NNET = NNETAR(diff_mw ~ hurricane + AR(p = 1, P = 4)))
+```
+
+```{r}
+test_ts$hurricane <- rep(0, 144)
+energy_fc <- models %>% fabletools::forecast(test_ts)
+fabletools::accuracy(energy_fc, test_ts) %>% arrange(MAPE)
+```
+
+```{r}
+diff_NN_model <- nnet_model %>% select(NNET)
+diff_NN_for <- forecast(diff_NN_model, test_ts)
+
+nnet_for <- rep(NA, 144)
+
+for(i in 1:24){
+  nnet_for[i] <- energy_impute$mw[length(train_ts$mw) - 24 + i] + diff_NN_for$.mean[i]
+}
+
+for(i in 25:144) {
+  # For the next 5 seasons (days) using forecasted values from first season instead of the original data
+  nnet_for[i] <- nnet_for[i - 24] + diff_NN_for$.mean[i]
+}
+
+NN_error <- test_ts$mw - nnet_for
+
+NN_MAE <- mean(abs(NN_error))
+NN_MAPE <- mean(abs(NN_error)/abs(test_ts$mw))*100
+
+NN_MAE
+NN_MAPE
+```
+
+

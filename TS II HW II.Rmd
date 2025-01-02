@@ -1,0 +1,184 @@
+---
+title: "TS II HW II"
+author: "Andrew Lewis"
+date: "2024-10-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Loading packages
+library(ggplot2)
+library(zoo)
+library(slider)
+library(readr)
+library(fpp3)
+library(forecast)
+library(imputeTS)
+```
+
+```{r}
+# Load the data
+train <- read_csv('hrl_load_metered.csv')
+val1 <- read_csv("hrl_load_metered - test1.csv")
+val2 <- read_csv("hrl_load_metered - test2.csv")
+val <- read_csv("hrl_load_metered - test3.csv")
+test <- read_csv("hrl_load_metered - test4.csv")
+
+# Converting the time variable to proper format
+train$datetime_beginning_ept <- as.POSIXct(train$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val1$datetime_beginning_ept <- as.POSIXct(val1$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val2$datetime_beginning_ept <- as.POSIXct(val2$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val$datetime_beginning_ept <- as.POSIXct(val$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+test$datetime_beginning_ept <- as.POSIXct(test$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+
+# Adding the first validation set back into the training set
+train <- rbind(train, val1)
+train <- rbind(train, val2)
+train <- rbind(train, val)
+
+train <- train %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+test <- test %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+# Averaging the Fall DST Values
+train <- train %>% group_by(datetime_beginning_ept) %>%
+   summarize(mw_new = mean(mw), na.rm = TRUE, Adjusted = first(Adjusted))
+
+train_ts <- train %>% as_tsibble(index = datetime_beginning_ept)
+test_ts <- test %>% as_tsibble(index = datetime_beginning_ept)
+
+# Impute missing times
+energy_impute <- train_ts %>% fill_gaps() %>%
+  mutate(mw = na_interpolation(mw_new, option = "linear"))
+
+energy_impute <- as_tsibble(energy_impute, index = datetime_beginning_ept)
+
+# Confirming which observations were imputed
+imputed <- anti_join(energy_impute, train_ts, by = "datetime_beginning_ept")
+
+# Add "Adjusted" flag to imputed observations
+train_ts <- energy_impute %>%
+ mutate(Adjusted = if_else(datetime_beginning_ept %in% imputed$datetime_beginning_ept, 1, 0))
+```
+
+```{r}
+model_diff <- train_ts %>% model("Empty" = ARIMA(mw ~ pdq(0,0,0) + PDQ(0,1,0)))
+residuals <- model_diff %>% select("Empty") %>% residuals()
+```
+
+```{r}
+library(fable.prophet)
+
+train_ts$hurricane <- rep(0, 59231)
+train_ts$hurricane[58992:59136] <- 1
+
+train_ts_trim <- train_ts %>%
+  filter(datetime_beginning_ept >= "2024-09-01 00:00:00")
+
+model_prophet <- train_ts_trim %>%
+  model(prophet(mw ~ hurricane +
+                  growth("linear") + 
+                  season(period = "day", order = 3, type = "multiplicative")))
+```
+
+```{r}
+model_fourier <- train_ts_trim %>%
+  model(Fourier = ARIMA(mw ~ fourier(K = 3, period = 24) + pdq(1,1,2) + PDQ(1,0,0) + 1))
+
+energy_fc <- model_fourier %>% fabletools::forecast(test_ts)
+fabletools::accuracy(energy_fc, test_ts)
+```
+
+```{r}
+model_prophet %>% components() %>% autoplot()
+```
+
+```{r}
+model_prophet %>% gg_tsresiduals()
+```
+
+```{r}
+augment(model_prophet) %>% features(.innov, ljung_box, lag = 72, dof = 5)
+```
+
+```{r}
+test_ts$hurricane <- rep(0, 168)
+
+model_prophet_for <- forecast(model_prophet, test_ts)
+
+# Time Plot of the predicted values and actual values for ONLY the test data set
+ggplot() +
+  # test data
+  geom_line(aes(x = datetime_beginning_ept, y = mw,  color = "Test"), data = test_ts) +  
+  # side note: .mean how the forecasted values are stored in a fable forecast object
+  geom_line(aes(x = datetime_beginning_ept, y = .mean, color = "Forecast"), data = model_prophet_for) +  
+  labs(x = "Month, Day", y = "Total MW", title = "Hourly MW from October 4th to October 10th", color = "Legend" ) + 
+  scale_color_manual(values = c("Test" = "black", "Forecast" = "#D55E00")) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+fabletools::accuracy(model_prophet_for, test_ts)
+```
+
+```{r}
+set.seed(12345)
+model_nnet <- train_ts_trim %>%
+  mutate(diff_mw = difference(mw, 24)) %>%
+  model(
+    hand = NNETAR(diff_mw ~ hurricane + AR(p = 1, P = 5))
+  )
+
+model_nnet %>% select(hand) %>% report()
+```
+
+```{r}
+model_nnet %>% select(hand) %>% gg_tsresiduals()
+```
+
+```{r}
+model_nnet_for <- forecast(model_nnet, test_ts)
+```
+
+```{r}
+nnet_for <- rep(NA, 168)
+
+for(i in 1:24){
+  nnet_for[i] <- train_ts$mw[length(train_ts$mw) - 24 + i] + model_nnet_for$.mean[i]
+}
+
+for(i in 1:144){
+  nnet_for[i + 24] <- nnet_for[i] + model_nnet_for$.mean[i + 24]
+}
+```
+
+```{r}
+NN_error <- test_ts$mw - nnet_for
+
+NN_MAE <- mean(abs(NN_error))
+NN_MAPE <- mean(abs(NN_error)/abs(test_ts$mw))*100
+
+NN_MAE
+NN_MAPE
+```
+
+auto(28, 1): 15.89
+
+1, 1: 13.13
+1, 2: 10.77
+1, 3: 9.26
+1, 4: 5.77
+1, 5: 5.92
+
+2, 1: 11.72
+2, 2: 11.16
+2, 3: 10.13

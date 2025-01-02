@@ -1,0 +1,58 @@
+---
+title: "TS I HW I"
+author: Andrew Lewis
+output: html_document
+date: "2024-08-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(fpp3)
+
+energy <- read_csv("energy_F2024.csv")
+energy.ts <- energy %>% mutate(date = date(mdy_hm(datetime_beginning_ept))) %>%
+  group_by(date) %>% summarize(daily_mw = sum(mw)) %>% 
+  mutate(month = yearmonth(date)) %>%
+  group_by(month) %>% summarize(daily_avg = mean(daily_mw)) %>%
+  as_tsibble(index = month)
+head(energy.ts)
+count_gaps(energy.ts)
+```
+
+```{r}
+train <- energy.ts %>% filter(date(month) < "2022-08-01")
+val <- energy.ts %>% filter(date(month) >= "2022-08-01" & date(month) < "2023-08-01")
+test <- energy.ts %>% filter(date(month) >= "2023-08-01")
+```
+
+```{r}
+median(train$daily_avg)
+```
+
+```{r}
+dcmp <- train %>% model(stl = STL(daily_avg))
+components(dcmp) %>% autoplot() + theme_classic()
+```
+
+```{r}
+components(dcmp) %>% as_tsibble() %>% autoplot(daily_avg, colour="gray") + 
+  geom_line(aes(y=season_adjust), colour ="#D55E00") + 
+  geom_line(aes(y=trend),colour="blue") + 
+  labs(x = "Month", y = "Total Daily Average MW", title = "Total Daily Average MW Over Time")
+```
+
+```{r}
+components(dcmp) %>% as_tsibble() %>% autoplot(daily_avg) + 
+  labs(x = "Month", y = "Total Daily Average MW", title = "Total Daily Average MW by Month")
+```
+
+```{r}
+train %>% features(daily_avg, feat_stl)
+```
+
+
+

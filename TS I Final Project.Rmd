@@ -1,0 +1,197 @@
+---
+title: "TS I Final Project"
+author: "Andrew Lewis"
+date: "2024-09-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Creating our initial tsibble
+library(readr)
+library(fpp3)
+library(forecast)
+
+energy <- read_csv("energy_F2024.csv")
+energy.ts <- energy %>% mutate(date = date(mdy_hm(datetime_beginning_ept))) %>%
+  group_by(date) %>% summarize(daily_mw = sum(mw)) %>% 
+  mutate(month = yearmonth(date)) %>%
+  group_by(month) %>% summarize(daily_avg = mean(daily_mw)) %>%
+  as_tsibble(index = month)
+head(energy.ts)
+count_gaps(energy.ts)
+```
+
+```{r}
+# Splitting the data into training, validation, and testing sets
+train <- energy.ts %>% filter(date(month) < "2022-08-01")
+val <- energy.ts %>% filter(date(month) >= "2022-08-01" & date(month) < "2023-08-01")
+test <- energy.ts %>% filter(date(month) >= "2023-08-01")
+```
+
+```{r}
+dc_additive <- train %>% model(classical_decomposition(daily_avg, type = "additive")) %>% components() 
+dc_additive <- dc_additive %>% select(month, daily_avg, trend, seasonal, random, season_adjust)
+dc_additive %>% gg_tsdisplay(season_adjust, plot_type = 'partial') + 
+  labs(title = "Classical Additive Decomposition of Seasonally Adjusted Average Daily MW",
+       x = "Month", y = "Seasonally Adjusted MW")
+```
+
+```{r}
+dc_additive %>% features(season_adjust, unitroot_kpss)
+dc_additive %>% features(season_adjust, unitroot_ndiffs)
+ndiffs(dc_additive$season_adjust)
+```
+
+```{r}
+# Autocorrelation function
+ggAcf(dc_additive$season_adjust, lag=12)
+```
+
+```{r}
+# Partial autocorrelation function
+ggPacf(dc_additive$season_adjust, lag=12)
+```
+
+```{r}
+auto <- auto.arima(dc_additive[,"season_adjust"], seasonal = F, stepwise = T, approximation = T, ic = c("aicc"))
+auto
+```
+
+```{r}
+mw_model <- dc_additive %>% model(ar1 = ARIMA(season_adjust ~ pdq(1,0,0) + PDQ(0,0,0)),
+                          ma1 = ARIMA(season_adjust ~ pdq(0,0,1) + PDQ(0,0,0)),
+                          ar1diff = ARIMA(season_adjust ~ pdq(1,1,0) + PDQ(0,0,0)),
+                          ma1diff = ARIMA(season_adjust ~ pdq(0,1,1) + PDQ(0,0,0)),
+                          ar2 = ARIMA(season_adjust ~ pdq(2,0,0) + PDQ(0,0,0)),
+                          ma2 = ARIMA(season_adjust ~ pdq(0,0,2) + PDQ(0,0,0)),
+                          ar2diff = ARIMA(season_adjust ~ pdq(2,1,0) + PDQ(0,0,0)),
+                          ma2diff = ARIMA(season_adjust ~ pdq(0,1,2) + PDQ(0,0,0)),
+                          arima212 = ARIMA(season_adjust ~ 0 + pdq(2,1,2) + PDQ(0,0,0)),
+                          search1 = ARIMA(season_adjust),
+                          search2 = ARIMA(season_adjust, stepwise = F),
+                          autoarima = ARIMA(season_adjust ~ pdq(1,1,1) + PDQ(0,0,0)))
+
+mw_model2<-as.data.frame(mw_model)
+t(mw_model2)
+
+glance(mw_model) %>% arrange(AICc) %>% select(.model:BIC)
+augment(mw_model) %>% features(.innov, ljung_box, lag=10, dof = 2)
+```
+
+```{r}
+mw_model %>% select(autoarima) %>% residuals() %>% ggAcf()
+mw_model %>% select(autoarima) %>% residuals() %>% ggPacf()
+mw_model %>% select(autoarima) %>% gg_tsresiduals()
+```
+
+```{r}
+# Forecast the seasonal component for the next 12 months
+last_season <- tail(dc_additive$seasonal, 12)  # Get the last 12 months of the seasonal component
+seasonal_forecast <- rep(last_season, length.out = 12)  # Repeat it for the next 12 months
+
+val$seas_frcst <- seasonal_forecast
+
+train$season_adjust <- dc_additive$season_adjust
+train$seas_frcst <- dc_additive$seasonal
+
+arima_models <- train %>%
+  model(arima111 = ARIMA(season_adjust ~ pdq(1,1,1) + PDQ(0,0,0)),
+        arima110 = ARIMA(season_adjust ~ pdq(1,1,0) + PDQ(0,0,0)),
+        arima210 = ARIMA(season_adjust ~ pdq(2,1,0) + PDQ(0,0,0))
+)
+
+t(arima_models)
+
+glance(arima_models) %>% 
+  arrange(AICc) %>% 
+  select(.model:BIC)
+
+train$arima111_fitted <- fitted(arima_models %>% select(arima111))$.fitted
+
+train$arima210_fitted <- fitted(arima_models %>% select(arima210))$.fitted
+
+forecast_111_seas_adj <- arima_models %>% 
+  select(arima111) %>% 
+  fabletools::forecast(h=12)
+forecast_110_seas_adj <- arima_models %>% 
+  select(arima110) %>% 
+  fabletools::forecast(h=12)
+forecast_210_seas_adj <- arima_models %>% 
+  select(arima210) %>% 
+  fabletools::forecast(h=12)
+
+val$seas_adj_frcst_arima111 <- forecast_111_seas_adj$.mean
+val$seas_adj_frcst_arima110 <- forecast_110_seas_adj$.mean
+val$seas_adj_frcst_arima210 <- forecast_210_seas_adj$.mean
+
+val <- val %>%
+  mutate(final_frcst_arima111 = seas_adj_frcst_arima111 + seas_frcst)
+val <- val %>%
+  mutate(final_frcst_arima110 = seas_adj_frcst_arima110 + seas_frcst)
+val <- val %>%
+  mutate(final_frcst_arima210 = seas_adj_frcst_arima210 + seas_frcst)
+
+val <- val %>%
+  mutate(ae_arima111 = abs(daily_avg-final_frcst_arima111)) %>%
+  mutate(ape_arima111 = ae_arima111/daily_avg)
+val <- val %>%
+  mutate(ae_arima110 = abs(daily_avg-final_frcst_arima110)) %>%
+  mutate(ape_arima110 = ae_arima110/daily_avg)
+val <- val %>%
+  mutate(ae_arima210 = abs(daily_avg-final_frcst_arima210)) %>%
+  mutate(ape_arima210 = ae_arima210/daily_avg)
+
+mean(val$ae_arima111)
+mean(val$ape_arima111) * 100
+
+mean(val$ae_arima110)
+mean(val$ape_arima110) * 100
+
+mean(val$ae_arima210)
+mean(val$ape_arima210) * 100
+```
+
+```{r plot-wider 2, fig.width=11, fig.height=5}
+ggplot(val, aes(x = month)) +
+  geom_line(aes(y = daily_avg, color = "Average Monthly MW")) +
+  geom_line(aes(y = final_frcst_arima111, color = "Forecasted MW")) +
+  labs(
+    title= "Validation ARIMA(1,1,1) - Average of Total Daily Energy Consumption by Month", 
+    y= "Energy Consumption in MW", 
+    x= "Year-Month",
+    color = ""
+  ) +
+  scale_color_manual(values = c("darkgrey", "#D55E00"))
+```
+
+```{r plot-wider 2, fig.width=11, fig.height=5}
+ggplot(val, aes(x = month)) +
+  geom_line(aes(y = daily_avg, color = "Average Monthly MW")) +
+  geom_line(aes(y = final_frcst_arima210, color = "Forecasted MW")) +
+  labs(
+    title= "Validation ARIMA(2,1,0) - Average of Total Daily Energy Consumption by Month", 
+    y= "Energy Consumption in MW", 
+    x= "Year-Month",
+    color = ""
+  ) +
+  scale_color_manual(values = c("darkgrey", "#D55E00"))
+```
+
+```{r plot-wider 2, fig.width=11, fig.height=5}
+ggplot(val, aes(x = month)) +
+  geom_line(aes(y = daily_avg, color = "Average Monthly MW")) +
+  geom_line(aes(y = final_frcst_arima111, color = "ARIMA(1,1,1) Forecasted MW")) +
+  geom_line(aes(y = final_frcst_arima110, color = "ARIMA(1,1,0) Forecasted MW")) +
+  geom_line(aes(y = final_frcst_arima210, color = "ARIMA(2,1,0) Forecasted MW")) +
+  labs(
+    title= "Validation ARIMA(1,1,0), ARIMA(1,1,1), and ARIMA(2,1,0) - Average of Total Daily Energy Consumption by Month", 
+    y= "Energy Consumption in MW", 
+    x= "Year-Month",
+    color = ""
+  ) +
+  scale_color_manual(values = c("blue","limegreen" ,"orange", "darkgrey"))
+```

@@ -1,0 +1,44 @@
+---
+title: "Time Series Workshop"
+output: html_document
+date: "2024-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(fpp3)
+library(readr)
+
+air <- read_csv("usairlines.csv")
+air.ts <- air %>% mutate(date = mdy(paste(Month, "1", Year))) %>% 
+  mutate(Month.ts = yearmonth(date)) %>% as_tsibble(index = Month.ts)
+head(air.ts)
+```
+
+```{r}
+count_gaps(air.ts)
+```
+
+```{r}
+autoplot(air.ts, Passengers)
+```
+
+```{r}
+energy <- read_csv("energy_F2024.csv")
+energy.ts <- energy %>% mutate(date = mdy_hm(datetime_beginning_ept)) %>%
+  group_by(date = date(date)) %>% summarize(mw = sum(mw)) %>% 
+  as_tsibble(index = date)
+energy.ts %>% arrange(desc(mw))
+```
+
+```{r}
+count_gaps(energy.ts)
+```
+
+```{r}
+autoplot(energy.ts, mw)
+```
+

@@ -1,0 +1,106 @@
+---
+title: "TS I HW II"
+author: Orange HW Team 18
+output: html_document
+date: "2024-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Creating our initial tsibble
+library(readr)
+library(fpp3)
+
+energy <- read_csv("energy_F2024.csv")
+energy.ts <- energy %>% mutate(date = date(mdy_hm(datetime_beginning_ept))) %>%
+  group_by(date) %>% summarize(daily_mw = sum(mw)) %>% 
+  mutate(month = yearmonth(date)) %>%
+  group_by(month) %>% summarize(daily_avg = mean(daily_mw)) %>%
+  as_tsibble(index = month)
+head(energy.ts)
+count_gaps(energy.ts)
+```
+
+```{r}
+# Splitting the data into training, validation, and testing sets
+train <- energy.ts %>% filter(date(month) < "2022-08-01")
+val <- energy.ts %>% filter(date(month) >= "2022-08-01" & date(month) < "2023-08-01")
+test <- energy.ts %>% filter(date(month) >= "2023-08-01")
+```
+
+```{r plot-wider, fig.width=11, fig.height=5}
+# Plotting the dataset with STL trend overlaid
+dcmp <- energy.ts %>% model(stl = STL(daily_avg))
+
+ggplot(components(dcmp), aes(x = month)) +
+  geom_line(aes(y = daily_avg, color = "Average Monthly MW")) +
+  geom_line(aes(y = trend, color = "Trend line")) +
+  labs(
+    title= "Average Total Daily Energy Consumption by Month",
+    y= "Energy Consumption in MW",
+    x= "Year-Month",
+    color = ""
+  ) +
+  scale_color_manual(values = c("darkgrey", "#D55E00"))
+```
+
+```{r}
+# Plotting STL decomposition components of the dataset
+components(dcmp) %>% autoplot() + theme_classic() + xlab("Year-Month") + 
+  ylab("Energy Consumption in MW") + ggtitle(label = "STL Decomposition", subtitle = "")
+```
+
+```{r}
+# Evaluating the trend and seasonality strength
+train %>% features(daily_avg, feat_stl)
+```
+
+```{r}
+# Comparing various ESMs based on their performance on the training set
+energy_fit <- train %>%
+  model(
+    SES = ETS(daily_avg ~ error("A") + trend("N") + season("N")),
+    `Linear` = ETS(daily_avg ~ error("A") + trend("A") + season("N")),
+    `Damped Linear` = ETS(daily_avg ~ error("A") + trend("Ad") + season("N")),
+    HWAdd = ETS(daily_avg ~ error("A") + trend("A") + season("A")),
+    HWMult = ETS(daily_avg ~ error("M") + trend("A") + season("M")),
+    AutoETS = ETS(daily_avg)
+  )
+
+fabletools::accuracy(energy_fit) %>% arrange(MAPE)
+```
+
+```{r}
+# Comparing various ESMs based on their performance on the validation set
+energy_fc <- energy_fit %>% fabletools::forecast(h = 12)
+
+fabletools::accuracy(energy_fc, val) %>% arrange(MAPE)
+```
+
+```{r}
+# Building a Holt-Winters Multiplicative ESM
+HWmult.energy <- train %>%
+  model(ETS(daily_avg ~ error("M") + trend("A") + season("M")))
+
+# Forecasting average daily MW for the range of months in the validation set
+energy.for <- HWmult.energy %>% fabletools::forecast(h = 12)
+report(HWmult.energy)
+```
+
+```{r plot-wider, fig.width=11, fig.height=5}
+# Plotting forecasted vs. actual MW values for the validation set
+val$forecast_mul <- energy.for$.mean
+
+ggplot(val, aes(x = month)) +
+  geom_line(aes(y = daily_avg, color = "Average Monthly MW")) +
+  geom_line(aes(y = forecast_mul, color = "Forecasted MW")) +
+  labs(
+    title= "HWSM Predicted vs. Actual Average Total Daily Energy Consumption by Month",
+    y= "Energy Consumption in MW",
+    x= "Year-Month",
+    color = ""
+  ) + scale_color_manual(values = c("darkgrey", "#D55E00"))
+```

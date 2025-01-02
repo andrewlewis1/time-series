@@ -1,0 +1,423 @@
+---
+title: "TS II HW I"
+author: "Andrew Lewis"
+date: "2024-10-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Loading packages
+library(ggplot2)
+library(zoo)
+library(slider)
+library(readr)
+library(fpp3)
+library(forecast)
+library(imputeTS)
+```
+
+```{r}
+# Load the data
+train <- read_csv('hrl_load_metered.csv')
+val1 <- read_csv("hrl_load_metered - test1.csv")
+val <- read_csv("hrl_load_metered - test2.csv")
+test <- read_csv("hrl_load_metered - test3.csv")
+
+# Converting the time variable to proper format
+train$datetime_beginning_ept <- as.POSIXct(train$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val1$datetime_beginning_ept <- as.POSIXct(val1$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+val$datetime_beginning_ept <- as.POSIXct(val$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+test$datetime_beginning_ept <- as.POSIXct(test$datetime_beginning_ept, format = "%m/%d/%y %H:%M", tz = "America/New_York")
+
+# Adding the first validation set back into the training set
+train <- rbind(train, val1)
+
+train <- train %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+val <- val %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+test <- test %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+# Averaging the Fall DST Values
+train <- train %>% group_by(datetime_beginning_ept) %>%
+   summarize(mw_new = mean(mw), na.rm = TRUE, Adjusted = first(Adjusted))
+
+train_ts <- train %>% as_tsibble(index = datetime_beginning_ept)
+val_ts <- val %>% as_tsibble(index = datetime_beginning_ept)
+test_ts <- test %>% as_tsibble(index = datetime_beginning_ept)
+
+# Impute missing times
+energy_impute <- train_ts %>% fill_gaps() %>%
+  mutate(mw = na_interpolation(mw_new, option = "linear"))
+
+energy_impute <- as_tsibble(energy_impute, index = datetime_beginning_ept)
+
+# Confirming which observations were imputed
+imputed <- anti_join(energy_impute, train_ts, by = "datetime_beginning_ept")
+
+# Add "Adjusted" flag to imputed observations
+train_ts <- energy_impute %>%
+ mutate(Adjusted = if_else(datetime_beginning_ept %in% imputed$datetime_beginning_ept, 1, 0))
+```
+
+```{r}
+# Creating a time plot of our training set
+autoplot(train_ts, mw) + labs(title= "Hourly Energy Usage", subtitle = "Energy in Megawatts", y= "Energy", x = "Date") + theme_classic() 
+```
+
+```{r}
+# Creating a STL decomposition of our training set
+dcmp <- train_ts %>% model(stl = STL(mw)) 
+components(dcmp) 
+components(dcmp) %>% autoplot() + theme_classic() 
+```
+
+```{r}
+# Evaluating trend and seasonal strength
+train_ts %>% features(mw, feat_stl)
+```
+
+```{r}
+# Finding the best ESM model
+energy_fit <- train_ts %>% model(
+    AAA = ETS(mw ~ error("A") + trend("A") + season("A")),
+    AAN = ETS(mw ~ error("A") + trend("A") + season("N")),
+    AAM = ETS(mw ~ error("A") + trend("A") + season("M")),
+    ANA = ETS(mw ~ error("A") + trend("N") + season("A")),
+    ANN = ETS(mw ~ error("A") + trend("N") + season("N")),
+    ANM = ETS(mw ~ error("A") + trend("N") + season("M")),
+    AAdA = ETS(mw ~ error("A") + trend("Ad") + season("A")),
+    AAdN = ETS(mw ~ error("A") + trend("Ad") + season("N")),
+    AAdM = ETS(mw ~ error("A") + trend("Ad") + season("M")),
+    MAA = ETS(mw ~ error("M") + trend("A") + season("A")),
+    MAN = ETS(mw ~ error("M") + trend("A") + season("N")),
+    MAM = ETS(mw ~ error("M") + trend("A") + season("M")),
+    MNA = ETS(mw ~ error("M") + trend("N") + season("A")),
+    MNN = ETS(mw ~ error("M") + trend("N") + season("N")),
+    MNM = ETS(mw ~ error("M") + trend("N") + season("M")),
+    MAdA = ETS(mw ~ error("M") + trend("Ad") + season("A")),
+    MAdN = ETS(mw ~ error("M") + trend("Ad") + season("N")),
+    MAdM = ETS(mw ~ error("M") + trend("Ad") + season("M")),
+    HWAuto = ETS(mw)
+  )
+
+fabletools::accuracy(energy_fit) %>% arrange(MAPE)
+```
+
+```{r}
+# Comparing various ESMs based on their performance on the validation set
+energy_fc <- energy_fit %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Forecasting our Holt-Winters multiplicative ESM
+energy_fc <- energy_fit %>% select(MAM) %>% fabletools::forecast(h = 168)
+
+# Time Plot of the predicted values and actual values for ONLY the validation data set.
+ggplot() +
+  # validation data
+  geom_line(aes(x = datetime_beginning_ept, y = mw,  color = "Validation"), data = val_ts) +  
+  # side note: .mean how the forecasted values are stored in a fable forecast object
+  geom_line(aes(x = datetime_beginning_ept, y = .mean, color = "Forecast"), data = energy_fc) +  
+  labs(x = "Month, Day", y = "Total MW", title = "Hourly MW from September 20th to September 26th", color = "Legend" ) + 
+  scale_color_manual(values = c("Validation" = "black", "Forecast" = "#D55E00")) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Performing unit root test and calculating the number of differences and seasonal differences needed
+train_ts %>% features(mw, unitroot_kpss)
+train_ts %>% features(mw, unitroot_ndiffs)
+train_ts %>% features(mw, unitroot_nsdiffs)
+```
+
+```{r}
+# Ensuring that we do not need to take a second difference
+train_ts %>% mutate(mw_diff = difference(mw, lag = 24)) %>% 
+  features(mw_diff, unitroot_ndiffs)
+```
+
+```{r}
+# Plotting ACF and PACF
+train_ts %>% gg_tsdisplay(mw, plot_type = 'partial') + 
+  labs(title = "Hourly Energy Usage",
+       x = "Hour", y = "MW")
+```
+
+```{r}
+# Building an ARIMA search model
+model_ARIMA <- train_ts %>%
+  model(Search = ARIMA(mw ~ PDQ(D = 1)))
+```
+
+```{r}
+# Examining our ARIMA search model
+glance(model_ARIMA)
+```
+
+```{r}
+# Evaluating accuracy of our ARIMA search model on the validation set
+energy_fc <- model_ARIMA %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Building K = 1 through 3 Fourier transformation models
+model_F_ARIMA <- train_ts %>%
+  model(
+  `K = 1` = ARIMA(mw ~ fourier(K = 1, period = 24) + PDQ(D = 0)),
+  `K = 2` = ARIMA(mw ~ fourier(K = 2, period = 24) + PDQ(D = 0)),
+  `K = 3` = ARIMA(mw ~ fourier(K = 3, period = 24) + PDQ(D = 0))
+)
+
+glance(model_F_ARIMA)
+```
+
+```{r}
+# Evaluating accuracy of first 3 Fourier models on the validation
+energy_fc <- model_F_ARIMA %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Building K = 4 through 6 Fourier transformation models
+model_F_ARIMA2 <- train_ts %>%
+  model(
+  `K = 4` = ARIMA(mw ~ fourier(K = 4, period = 24) + PDQ(D = 0)),
+  `K = 5` = ARIMA(mw ~ fourier(K = 5, period = 24) + PDQ(D = 0)),
+  `K = 6` = ARIMA(mw ~ fourier(K = 6, period = 24) + PDQ(D = 0))
+)
+
+glance(model_F_ARIMA2)
+```
+
+```{r}
+# Evaluating accuracy of our second 3 Fourier models on the validation
+energy_fc <- model_F_ARIMA2 %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Plotting the residuals of the K = 3 Fourier model
+model_F_ARIMA %>%
+  select(`K = 3`) %>%
+  gg_tsresiduals(lag = 72)
+```
+
+```{r}
+# Forecasting our K = 3 Fourier model on the validation
+energy_fc <- model_F_ARIMA %>% select(`K = 3`) %>% fabletools::forecast(h = 168)
+
+# Time Plot of the predicted values and actual values for ONLY the validation data set
+ggplot() +
+  # validation data
+  geom_line(aes(x = datetime_beginning_ept, y = mw,  color = "Validation"), data = val_ts) +  
+  # side note: .mean how the forecasted values are stored in a fable forecast object
+  geom_line(aes(x = datetime_beginning_ept, y = .mean, color = "Forecast"), data = energy_fc) +  
+  labs(x = "Month, Day", y = "Total MW", title = "Hourly MW from September 20th to September 26th", color = "Legend" ) + 
+  scale_color_manual(values = c("Validation" = "black", "Forecast" = "#D55E00")) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Extracting the residuals of the K = 3 Fourier model
+residuals <- model_F_ARIMA %>% select(`K = 3`) %>% residuals()
+
+# ACF plot with 99.99% confidence level (wider CI)
+acf_data <- Acf(residuals, lag.max = 72, plot = FALSE)
+
+# Plot ACF with custom y-axis limits
+autoplot(acf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) +  
+  labs(title = "ACF Plot")
+
+# PACF plot with 99.99% confidence level (wider CI)
+pacf_data <- Pacf(residuals, lag.max = 72, plot = FALSE, ci = 0.999)
+
+# Plot PACF with custom y-axis limits
+autoplot(pacf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) + 
+  labs(title = "ACF Plot")
+
+# Performing Ljung-Box test on the K = 3 model
+augment(model_F_ARIMA) %>% filter(.model == "K = 3") %>% features(.innov, ljung_box, lag = 72, dof = 4)
+```
+
+```{r}
+# Ensuring that a non-seasonal difference was appropriate
+model_nodiff <- train_ts %>% 
+  model(`K = 3` = ARIMA(mw ~ fourier(K = 3, period = 24) + pdq(1,0,2) + PDQ(1,0,0)))
+
+residuals <- model_nodiff %>% select(`K = 3`) %>% residuals()
+residuals %>% features(.resid, unitroot_ndiffs)
+
+# ACF plot with 99.99% confidence level (wider CI)
+acf_data <- Acf(residuals, lag.max = 72, plot = FALSE)
+
+# Plot ACF with custom y-axis limits
+autoplot(acf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) +  
+  labs(title = "ACF Plot")
+
+# PACF plot with 99.99% confidence level (wider CI)
+pacf_data <- Pacf(residuals, lag.max = 72, plot = FALSE, ci = 0.999)
+
+autoplot(pacf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) + 
+  labs(title = "ACF Plot")
+
+augment(model_nodiff) %>% filter(.model == "K = 3") %>% features(.innov, ljung_box, lag = 72, dof = 0)
+```
+
+```{r}
+# Building K = 7 through 9 Fourier transformation models
+model_F_ARIMA3 <- train_ts %>%
+  model(
+  `K = 7` = ARIMA(mw ~ fourier(K = 7, period = 24) + PDQ(D = 0)),
+  `K = 8` = ARIMA(mw ~ fourier(K = 8, period = 24) + PDQ(D = 0)),
+  `K = 9` = ARIMA(mw ~ fourier(K = 9, period = 24) + PDQ(D = 0))
+)
+
+glance(model_F_ARIMA3)
+```
+
+```{r}
+# Evaluating accuracy of our third 3 Fourier models on the validation set
+energy_fc <- model_F_ARIMA3 %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Building K = 10 through 12 Fourier transformation models
+model_F_ARIMA4 <- train_ts %>%
+  model(
+  `K = 10` = ARIMA(mw ~ fourier(K = 10, period = 24) + PDQ(D = 0)),
+  `K = 11` = ARIMA(mw ~ fourier(K = 11, period = 24) + PDQ(D = 0)),
+  `K = 12` = ARIMA(mw ~ fourier(K = 12, period = 24) + PDQ(D = 0))
+)
+
+glance(model_F_ARIMA4)
+```
+
+```{r}
+# Evaluating accuracy of our last 3 Fourier models on the validation set
+energy_fc <- model_F_ARIMA4 %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, val_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Adding the first validation set back into the training set
+train$mw <- train$mw_new
+train <- train %>% select(datetime_beginning_ept, mw, Adjusted)
+val <- val %>% select(datetime_beginning_ept, mw, Adjusted)
+train <- rbind(train, val)
+
+train <- train %>%
+  add_count(datetime_beginning_ept, name = "count") %>%
+  mutate(Adjusted = ifelse(count > 1, 1, 0))
+
+# Averaging the Fall DST Values
+train <- train %>% group_by(datetime_beginning_ept) %>%
+   summarize(mw_new = mean(mw), na.rm = TRUE, Adjusted = first(Adjusted))
+
+train_ts <- train %>% as_tsibble(index = datetime_beginning_ept)
+
+# Impute missing times
+energy_impute <- train_ts %>% fill_gaps() %>%
+  mutate(mw = na_interpolation(mw_new, option = "linear"))
+
+energy_impute <- as_tsibble(energy_impute, index = datetime_beginning_ept)
+
+# Confirming which observations were imputed
+imputed <- anti_join(energy_impute, train_ts, by = "datetime_beginning_ept")
+
+# Add "Adjusted" flag to imputed observations
+train_ts <- energy_impute %>%
+ mutate(Adjusted = if_else(datetime_beginning_ept %in% imputed$datetime_beginning_ept, 1, 0))
+```
+
+```{r}
+# Refitting our final ESM on the validation + training to evaluate accuracy on test
+esm_final <- train_ts %>% model(MAM = ETS(mw ~ error("M") + trend("A") + season("M")))
+
+energy_fc <- esm_final %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, test_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Time Plot of the predicted values and actual values for ONLY the test data set
+ggplot() +
+  # validation data
+  geom_line(aes(x = datetime_beginning_ept, y = mw,  color = "Test"), data = test_ts) +  
+  # side note: .mean how the forecasted values are stored in a fable forecast object
+  geom_line(aes(x = datetime_beginning_ept, y = .mean, color = "Forecast"), data = energy_fc) +  
+  labs(x = "Month, Day", y = "Total MW", title = "Hourly MW from September 27th to October 3rd", color = "Legend" ) + 
+  scale_color_manual(values = c("Test" = "black", "Forecast" = "#D55E00")) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Refitting our final model on the validation + training to evaluate accuracy on test
+final_model <- train_ts %>% model(`K = 3` = ARIMA(mw ~ fourier(K = 3, period = 24) + PDQ(D = 0)))
+
+energy_fc <- final_model %>% fabletools::forecast(h = 168)
+
+fabletools::accuracy(energy_fc, test_ts) %>% arrange(MAPE)
+```
+
+```{r}
+# Time Plot of the predicted values and actual values for ONLY the test data set
+ggplot() +
+  # validation data
+  geom_line(aes(x = datetime_beginning_ept, y = mw,  color = "Test"), data = test_ts) +  
+  # side note: .mean how the forecasted values are stored in a fable forecast object
+  geom_line(aes(x = datetime_beginning_ept, y = .mean, color = "Forecast"), data = energy_fc) +  
+  labs(x = "Month, Day", y = "Total MW", title = "Hourly MW from September 27th to October 3rd", color = "Legend" ) + 
+  scale_color_manual(values = c("Test" = "black", "Forecast" = "#D55E00")) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Extracting the residuals of our final model
+residuals <- final_model %>% select(`K = 3`) %>% residuals()
+
+# ACF plot with 99.99% confidence level (wider CI)
+acf_data <- Acf(residuals, lag.max = 72, plot = FALSE)
+
+# Plot ACF with custom y-axis limits
+autoplot(acf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) +  
+  labs(title = "ACF Plot")
+
+# PACF plot with 99.99% confidence level (wider CI)
+pacf_data <- Pacf(residuals, lag.max = 72, plot = FALSE, ci = 0.999)
+
+# Plot PACF with custom y-axis limits
+autoplot(pacf_data, ci = 0.999) +
+  ylim(-0.25, 0.25) + 
+  labs(title = "ACF Plot")
+
+augment(final_model) %>% filter(.model == "K = 3") %>% features(.innov, ljung_box, lag = 72, dof = 4)
+```
